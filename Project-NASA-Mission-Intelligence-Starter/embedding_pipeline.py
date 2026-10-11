@@ -1,512 +1,579 @@
 #!/usr/bin/env python3
 """
-ChromaDB Embedding Pipeline for NASA Space Mission Data - Text Files Only
+ChromaDB Embedding Pipeline for NASA Space Mission Data — text files only.
 
-This script reads parsed text data from various NASA space mission folders and creates
-a permanent ChromaDB collection with OpenAI embeddings for RAG applications.
-Optimized to process only text files to avoid duplication with JSON versions.
+Reads NASA transcript text files from data_text/<mission>/*.txt, chunks each
+file with configurable size + overlap, embeds the chunks with an OpenAI
+embedding model (or a local sentence-transformers model in mock mode), and
+persists them to a ChromaDB collection with rich per-chunk metadata.
 
-Supported data sources:
-- Apollo 11 extracted data (text files only)
-- Apollo 13 extracted data (text files only)
-- Apollo 11 Textract extracted data (text files only)
-- Challenger transcribed audio data (text files only)
+Run `python embedding_pipeline.py --help` for the full CLI surface.
 """
 
-import os
-import json
-import logging
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-import chromadb
-from chromadb.config import Settings
-import openai
-from openai import OpenAI
+import argparse
 import hashlib
+import logging
+import os
+import re
 import time
 from datetime import datetime
-import argparse
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# Configure logging
+import chromadb
+from chromadb.config import Settings
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('chroma_embedding_text_only.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("chroma_embedding_text_only.log"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
+
+def _mock_embed(text: str, dim: int = 384) -> List[float]:
+    """Deterministic offline embedding. Hash-based, NOT semantic.
+
+    Used only when NASA_RAG_MOCK=1 so the pipeline can run end-to-end without
+    an OpenAI key. Quality of retrieval is terrible — this is for wiring/smoke
+    tests only.
+    """
+    h = hashlib.sha512(text.encode("utf-8")).digest()
+    # Stretch the 64-byte hash to `dim` floats in [-1, 1).
+    vec = []
+    while len(vec) < dim:
+        for b in h:
+            vec.append((b - 128) / 128.0)
+            if len(vec) >= dim:
+                break
+        h = hashlib.sha512(h).digest()
+    # L2-normalise so cosine similarity behaves.
+    s = sum(v * v for v in vec) ** 0.5 or 1.0
+    return [v / s for v in vec]
+
+
 class ChromaEmbeddingPipelineTextOnly:
-    """Pipeline for creating ChromaDB collections with OpenAI embeddings - Text files only"""
-    
-    def __init__(self, 
-                 openai_api_key: str,
-                 chroma_persist_directory: str = "./chroma_db",
-                 collection_name: str = "nasa_space_missions_text",
-                 embedding_model: str = "text-embedding-3-small",
-                 chunk_size: int = 1000,
-                 chunk_overlap: int = 200):
-        """
-        Initialize the embedding pipeline
-        
-        Args:
-            openai_api_key: OpenAI API key
-            chroma_persist_directory: Directory to persist ChromaDB
-            collection_name: Name of the ChromaDB collection
-            embedding_model: OpenAI embedding model to use
-            chunk_size: Maximum size of text chunks
-            chunk_overlap: Overlap between chunks
-        """
-        # TODO: Initialize OpenAI client
-        # TODO: Store configuration parameters
-        # TODO: Initialize ChromaDB client
-        # TODO: Create or get collection
-    
+    """Pipeline for creating ChromaDB collections with OpenAI embeddings."""
+
+    def __init__(
+        self,
+        openai_api_key: str,
+        chroma_persist_directory: str = "./chroma_db_openai",
+        collection_name: str = "nasa_space_missions_text",
+        embedding_model: str = "text-embedding-3-small",
+        chunk_size: int = 1000,
+        chunk_overlap: int = 200,
+    ):
+        # Store configuration. chunk_overlap is clamped to chunk_size-1 to keep
+        # the chunker making forward progress.
+        self.openai_api_key = openai_api_key
+        self.chroma_persist_directory = chroma_persist_directory
+        self.collection_name = collection_name
+        self.embedding_model = embedding_model
+        self.chunk_size = chunk_size
+        self.chunk_overlap = min(chunk_overlap, max(0, chunk_size - 1))
+
+        # Pick an embedding backend. Three paths:
+        #   - "mock" (NASA_RAG_MOCK=1): deterministic hash embeddings, offline.
+        #   - "sentence-transformers" (EMBEDDING_PROVIDER=sentence-transformers):
+        #       free, local, no API key. Default model: all-MiniLM-L6-v2 (~80 MB).
+        #   - "openai" (default): OpenAI Python SDK. Honours OPENAI_BASE_URL so
+        #       any OpenAI-compatible provider (Together / Groq / OpenRouter /
+        #       HuggingFace Inference Providers / Ollama / vLLM / LM Studio) works.
+        self._mock = os.getenv("NASA_RAG_MOCK") == "1"
+        self._provider = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
+        self.openai_client = None
+        self._st_model = None
+
+        if self._mock:
+            logger.info("NASA_RAG_MOCK=1 -> using deterministic hash embeddings")
+        elif self._provider == "sentence-transformers":
+            try:
+                from sentence_transformers import SentenceTransformer  # noqa: WPS433
+            except ImportError as exc:
+                raise RuntimeError(
+                    "EMBEDDING_PROVIDER=sentence-transformers requires "
+                    "`pip install sentence-transformers`"
+                ) from exc
+            st_name = os.getenv("ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+            logger.info("Loading sentence-transformers model: %s", st_name)
+            self._st_model = SentenceTransformer(st_name)
+        else:
+            from openai import OpenAI  # noqa: WPS433 (intentional local import)
+            self.openai_client = OpenAI(
+                api_key=openai_api_key or os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv("OPENAI_BASE_URL") or None,
+            )
+
+        # ChromaDB persistent client. Telemetry off — it crashes when offline.
+        self.chroma_client = chromadb.PersistentClient(
+            path=chroma_persist_directory,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        logger.info(
+            "Pipeline ready: dir=%s collection=%s chunk_size=%d overlap=%d model=%s",
+            chroma_persist_directory, collection_name, chunk_size, chunk_overlap,
+            "mock" if self._mock else embedding_model,
+        )
+
+    # ---------------------------------------------------------------- chunking
     def chunk_text(self, text: str, metadata: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+        """Split text into overlapping chunks, snapping to sentence boundaries.
+
+        Returns a list of (chunk_text, chunk_metadata) tuples. Each chunk's
+        metadata is the file-level metadata plus chunk_index, chunk_count,
+        char_start, char_end.
         """
-        Split text into chunks with metadata
-        
-        Args:
-            text: Text to chunk
-            metadata: Base metadata for the text
-            
-        Returns:
-            List of (chunk_text, chunk_metadata) tuples
-        """
-        # TODO: Handle short texts that don't need chunking
-        # TODO: Implement chunking logic with overlap
-        # TODO: Try to break at sentence boundaries
-        # TODO: Create metadata for each chunk
-        pass
-    
-    def check_document_exists(self, doc_id: str) -> bool:
-        """
-        Check if a document with the given ID already exists in the collection
-        
-        Args:
-            doc_id: Document ID to check
-            
-        Returns:
-            True if document exists, False otherwise
-        """
-        # TODO: Query collection for document ID
-        # TODO: Return True if exists, False otherwise
-        pass
-    
-    def update_document(self, doc_id: str, text: str, metadata: Dict[str, Any]) -> bool:
-        """
-        Update an existing document in the collection
-        
-        Args:
-            doc_id: Document ID to update
-            text: New text content
-            metadata: New metadata
-            
-        Returns:
-            True if successful, False otherwise
-        """
+        text = text.strip()
+        if not text:
+            return []
+
+        # Documents shorter than chunk_size are kept whole.
+        if len(text) <= self.chunk_size:
+            meta = {**metadata, "chunk_index": 0, "chunk_count": 1,
+                    "char_start": 0, "char_end": len(text)}
+            return [(text, meta)]
+
+        # Sliding window with sentence-boundary snap.
+        chunks: List[Tuple[str, Dict[str, Any]]] = []
+        start = 0
+        idx = 0
+        step = max(1, self.chunk_size - self.chunk_overlap)
+        while start < len(text):
+            end = min(start + self.chunk_size, len(text))
+
+            # Try to break at the last sentence terminator in the back half of
+            # the window — keeps chunks readable.
+            if end < len(text):
+                slice_ = text[start:end]
+                half = len(slice_) // 2
+                m = None
+                for match in re.finditer(r"[\.\!\?]\s+", slice_):
+                    if match.end() >= half:
+                        m = match
+                if m is not None:
+                    end = start + m.end()
+
+            chunk = text[start:end].strip()
+            if chunk:
+                meta = {
+                    **metadata,
+                    "chunk_index": idx,
+                    "char_start":  start,
+                    "char_end":    end,
+                }
+                chunks.append((chunk, meta))
+                idx += 1
+            start = start + step if end == start + self.chunk_size else end - self.chunk_overlap
+            if start <= 0 or start >= len(text):
+                break
+
+        total = len(chunks)
+        for ct, m in chunks:
+            m["chunk_count"] = total
+        return chunks
+
+    # ----------------------------------------------------------- embedding API
+    def get_embedding(self, text: str) -> List[float]:
+        """Get a single embedding vector for `text`."""
+        if self._mock:
+            return _mock_embed(text)
+        if self._st_model is not None:
+            return self._st_model.encode(text, normalize_embeddings=True).tolist()
         try:
-            # Get new embedding
+            resp = self.openai_client.embeddings.create(
+                model=self.embedding_model,
+                input=text,
+            )
+            return resp.data[0].embedding
+        except Exception as exc:
+            logger.error("Embedding error (text len=%d): %s", len(text), exc)
+            raise
+
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Embed a batch of texts in one API call (or locally)."""
+        if self._mock:
+            return [_mock_embed(t) for t in texts]
+        if self._st_model is not None:
+            arr = self._st_model.encode(
+                texts, batch_size=32, normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            return arr.tolist()
+        resp = self.openai_client.embeddings.create(
+            model=self.embedding_model,
+            input=texts,
+        )
+        return [d.embedding for d in resp.data]
+
+    # ---------------------------------------------------------- collection ops
+    def check_document_exists(self, doc_id: str) -> bool:
+        """Return True if a chunk with this id is already in the collection."""
+        try:
+            res = self.collection.get(ids=[doc_id])
+            return bool(res and res.get("ids"))
+        except Exception as exc:
+            logger.error("exists-check failed for %s: %s", doc_id, exc)
+            return False
+
+    def update_document(self, doc_id: str, text: str, metadata: Dict[str, Any]) -> bool:
+        """Update an existing document in the collection."""
+        try:
             embedding = self.get_embedding(text)
-            
-            # Update the document
             self.collection.update(
                 ids=[doc_id],
                 documents=[text],
                 metadatas=[metadata],
-                embeddings=[embedding]
+                embeddings=[embedding],
             )
-            logger.debug(f"Updated document: {doc_id}")
+            logger.debug("Updated document: %s", doc_id)
             return True
-        except Exception as e:
-            logger.error(f"Error updating document {doc_id}: {e}")
+        except Exception as exc:
+            logger.error("Error updating document %s: %s", doc_id, exc)
             return False
-    
+
     def delete_documents_by_source(self, source_pattern: str) -> int:
-        """
-        Delete all documents from a specific source (useful for re-processing files)
-        
-        Args:
-            source_pattern: Pattern to match source names
-            
-        Returns:
-            Number of documents deleted
-        """
+        """Delete all documents whose `source` metadata contains `source_pattern`."""
         try:
-            # Get all documents
             all_docs = self.collection.get()
-            
-            # Find documents matching the source pattern
-            ids_to_delete = []
-            for i, metadata in enumerate(all_docs['metadatas']):
-                if source_pattern in metadata.get('source', ''):
-                    ids_to_delete.append(all_docs['ids'][i])
-            
+            ids_to_delete = [
+                all_docs["ids"][i]
+                for i, m in enumerate(all_docs["metadatas"] or [])
+                if source_pattern in (m or {}).get("source", "")
+            ]
             if ids_to_delete:
                 self.collection.delete(ids=ids_to_delete)
-                logger.info(f"Deleted {len(ids_to_delete)} documents matching source pattern: {source_pattern}")
+                logger.info("Deleted %d documents matching source pattern: %s",
+                            len(ids_to_delete), source_pattern)
                 return len(ids_to_delete)
-            else:
-                logger.info(f"No documents found matching source pattern: {source_pattern}")
-                return 0
-                
-        except Exception as e:
-            logger.error(f"Error deleting documents by source: {e}")
+            logger.info("No documents found matching source pattern: %s", source_pattern)
             return 0
-    
+        except Exception as exc:
+            logger.error("Error deleting documents by source: %s", exc)
+            return 0
+
     def get_file_documents(self, file_path: Path) -> List[str]:
-        """
-        Get all document IDs for a specific file
-        
-        Args:
-            file_path: Path to the file
-            
-        Returns:
-            List of document IDs for the file
-        """
+        """Return all chunk ids that belong to a given source file."""
         try:
             source = file_path.stem
             mission = self.extract_mission_from_path(file_path)
-            
-            # Get all documents
             all_docs = self.collection.get()
-            
-            # Find documents from this file
-            file_doc_ids = []
-            for i, metadata in enumerate(all_docs['metadatas']):
-                if (metadata.get('source') == source and 
-                    metadata.get('mission') == mission):
-                    file_doc_ids.append(all_docs['ids'][i])
-            
-            return file_doc_ids
-            
-        except Exception as e:
-            logger.error(f"Error getting file documents: {e}")
+            return [
+                all_docs["ids"][i]
+                for i, m in enumerate(all_docs["metadatas"] or [])
+                if (m or {}).get("source") == source and (m or {}).get("mission") == mission
+            ]
+        except Exception as exc:
+            logger.error("Error getting file documents: %s", exc)
             return []
-    
-    def get_embedding(self, text: str) -> List[float]:
-        """
-        Get OpenAI embedding for text
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector
-        """
-        # TODO: Call OpenAI embeddings API
-        # TODO: Return embedding vector
-        # TODO: Add error handling
-        pass
 
+    # ----------------------------------------------------------- id generation
     def generate_document_id(self, file_path: Path, metadata: Dict[str, Any]) -> str:
-        """
-        Generate stable document ID based on file path and chunk position
-        This allows for document updates without changing IDs
-        """
-        # TODO: Create consistent ID format
-        # TODO: Use mission, source, and chunk_index
-        # Format: mission_source_chunk_0001
-        pass
-    
+        """Stable chunk id: <mission>_<source>_chunk_<NNNN>."""
+        mission = metadata.get("mission") or self.extract_mission_from_path(file_path)
+        source  = metadata.get("source")  or file_path.stem
+        idx     = metadata.get("chunk_index", 0)
+        return f"{mission}_{source}_chunk_{int(idx):04d}"
+
+    # ----------------------------------------------------------- file handling
     def process_text_file(self, file_path: Path) -> List[Tuple[str, Dict[str, Any]]]:
-        """
-        Process plain text files with enhanced metadata extraction
-        
-        Args:
-            file_path: Path to text file
-            
-        Returns:
-            List of (text, metadata) tuples
-        """
+        """Process a plain text file with enriched metadata."""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            
             if not content.strip():
                 return []
-            
-            # Enhanced metadata extraction
             metadata = {
-                'source': file_path.stem,
-                'file_path': str(file_path),
-                'file_type': 'text',
-                'content_type': 'full_text',
-                'mission': self.extract_mission_from_path(file_path),
-                'data_type': self.extract_data_type_from_path(file_path),
-                'document_category': self.extract_document_category_from_filename(file_path.name),
-                'file_size': len(content),
-                'processed_timestamp': datetime.now().isoformat()
+                "source":             file_path.stem,
+                "file_path":          str(file_path),
+                "file_type":          "text",
+                "content_type":       "full_text",
+                "mission":            self.extract_mission_from_path(file_path),
+                "data_type":          self.extract_data_type_from_path(file_path),
+                "document_category":  self.extract_document_category_from_filename(file_path.name),
+                "file_size":          len(content),
+                "processed_timestamp": datetime.now().isoformat(),
             }
-            
             return self.chunk_text(content, metadata)
-            
-        except Exception as e:
-            logger.error(f"Error processing text file {file_path}: {e}")
+        except Exception as exc:
+            logger.error("Error processing text file %s: %s", file_path, exc)
             return []
-    
+
     def extract_mission_from_path(self, file_path: Path) -> str:
-        """Extract mission name from file path"""
         path_str = str(file_path).lower()
-        if 'apollo11' in path_str or 'apollo_11' in path_str:
-            return 'apollo_11'
-        elif 'apollo13' in path_str or 'apollo_13' in path_str:
-            return 'apollo_13'
-        elif 'challenger' in path_str:
-            return 'challenger'
-        else:
-            return 'unknown'
-    
+        if "apollo11" in path_str or "apollo_11" in path_str:
+            return "apollo_11"
+        if "apollo13" in path_str or "apollo_13" in path_str:
+            return "apollo_13"
+        if "challenger" in path_str:
+            return "challenger"
+        return "unknown"
+
     def extract_data_type_from_path(self, file_path: Path) -> str:
-        """Extract data type from file path"""
         path_str = str(file_path).lower()
-        if 'transcript' in path_str:
-            return 'transcript'
-        elif 'textract' in path_str:
-            return 'textract_extracted'
-        elif 'audio' in path_str:
-            return 'audio_transcript'
-        elif 'flight_plan' in path_str:
-            return 'flight_plan'
-        else:
-            return 'document'
-    
+        if "transcript" in path_str:
+            return "transcript"
+        if "textract" in path_str:
+            return "textract_extracted"
+        if "audio" in path_str:
+            return "audio_transcript"
+        if "flight_plan" in path_str:
+            return "flight_plan"
+        return "document"
+
     def extract_document_category_from_filename(self, filename: str) -> str:
-        """Extract document category from filename for better organization"""
-        filename_lower = filename.lower()
-        
-        # Apollo transcript types
-        if 'pao' in filename_lower:
-            return 'public_affairs_officer'
-        elif 'cm' in filename_lower:
-            return 'command_module'
-        elif 'tec' in filename_lower:
-            return 'technical'
-        elif 'flight_plan' in filename_lower:
-            return 'flight_plan'
-        
-        # Challenger audio segments
-        elif 'mission_audio' in filename_lower:
-            return 'mission_audio'
-        
-        # NASA archive documents
-        elif 'ntrs' in filename_lower:
-            return 'nasa_archive'
-        elif '19900066485' in filename_lower:
-            return 'technical_report'
-        elif '19710015566' in filename_lower:
-            return 'mission_report'
-        
-        # General categories
-        elif 'full_text' in filename_lower:
-            return 'complete_document'
-        else:
-            return 'general_document'
-    
+        fl = filename.lower()
+        if "pao" in fl:                return "public_affairs_officer"
+        if "_cm_" in fl or fl.endswith("_cm.txt") or "_cm.txt" in fl: return "command_module"
+        if "_tec_" in fl or "_tec.txt" in fl:                          return "technical"
+        if "flight_plan" in fl:        return "flight_plan"
+        if "mission_audio" in fl:      return "mission_audio"
+        if "ntrs" in fl:               return "nasa_archive"
+        if "19900066485" in fl:        return "technical_report"
+        if "19710015566" in fl:        return "mission_report"
+        if "full_text" in fl:          return "complete_document"
+        return "general_document"
+
+    # ------------------------------------------------------- file discovery
     def scan_text_files_only(self, base_path: str) -> List[Path]:
-        """
-        Scan data directories for text files only (avoiding JSON duplicates)
-        
-        Args:
-            base_path: Base directory path
-            
-        Returns:
-            List of text file paths to process
-        """
+        """Return a list of *.txt files under base_path/{apollo11,apollo13,challenger}."""
         base_path = Path(base_path)
-        files_to_process = []
-        
-        # Define directories to scan
-        data_dirs = [
-            'apollo11',
-            'apollo13',
-            'challenger'
-        ]
-        
-        for data_dir in data_dirs:
+        files_to_process: List[Path] = []
+        for data_dir in ("apollo11", "apollo13", "challenger"):
             dir_path = base_path / data_dir
             if dir_path.exists():
-                logger.info(f"Scanning directory: {dir_path}")
-                
-                # Find only text files
-                text_files = list(dir_path.glob('**/*.txt'))
+                logger.info("Scanning directory: %s", dir_path)
+                text_files = list(dir_path.glob("**/*.txt"))
                 files_to_process.extend(text_files)
-                logger.info(f"Found {len(text_files)} text files in {data_dir}")
-        
-        # Filter out unwanted files
-        filtered_files = []
-        for file_path in files_to_process:
-            # Skip system files and summaries
-            if (file_path.name.startswith('.') or 
-                'summary' in file_path.name.lower() or
-                file_path.suffix.lower() != '.txt'):
-                continue
-            filtered_files.append(file_path)
-        
-        logger.info(f"Total text files to process: {len(filtered_files)}")
-        
-        # Log file breakdown by mission
-        mission_counts = {}
-        for file_path in filtered_files:
-            mission = self.extract_mission_from_path(file_path)
-            mission_counts[mission] = mission_counts.get(mission, 0) + 1
-        
+                logger.info("Found %d text files in %s", len(text_files), data_dir)
+        filtered = [
+            p for p in files_to_process
+            if not p.name.startswith(".")
+            and "summary" not in p.name.lower()
+            and p.suffix.lower() == ".txt"
+        ]
+        logger.info("Total text files to process: %d", len(filtered))
+        mission_counts: Dict[str, int] = {}
+        for p in filtered:
+            m = self.extract_mission_from_path(p)
+            mission_counts[m] = mission_counts.get(m, 0) + 1
         logger.info("Files by mission:")
         for mission, count in mission_counts.items():
-            logger.info(f"  {mission}: {count} files")
-        
-        return filtered_files
-    
-    def add_documents_to_collection(self, documents: List[Tuple[str, Dict[str, Any]]], 
-                                   file_path: Path, batch_size: int = 50, 
-                                   update_mode: str = 'skip') -> Dict[str, int]:
-        """
-        Add documents to ChromaDB collection in batches with update handling
-        
-        Args:
-            documents: List of (text, metadata) tuples
-            file_path: Path to the source file
-            batch_size: Number of documents to process in each batch
-            update_mode: How to handle existing documents:
-                        'skip' - skip existing documents
-                        'update' - update existing documents
-                        'replace' - delete all existing documents from file and re-add
-            
-        Returns:
-            Dictionary with counts of added, updated, and skipped documents
+            logger.info("  %s: %d files", mission, count)
+        return filtered
+
+    # ---------------------------------------------------------- write to chroma
+    def add_documents_to_collection(
+        self,
+        documents: List[Tuple[str, Dict[str, Any]]],
+        file_path: Path,
+        batch_size: int = 50,
+        update_mode: str = "skip",
+    ) -> Dict[str, int]:
+        """Add (or update / replace) chunks in the ChromaDB collection.
+
+        update_mode:
+            skip    - skip a chunk if its id already exists (default).
+            update  - re-embed and overwrite existing chunks.
+            replace - delete every existing chunk for this file first, then add.
         """
         if not documents:
-            return {'added': 0, 'updated': 0, 'skipped': 0}
-        
-        stats = {'added': 0, 'updated': 0, 'skipped': 0}
-        
-        # TODO: Handle different update modes (skip, update, replace)
-        # TODO: Process documents in batches
-        # TODO: For each document:
-        #   - Generate document ID
-        #   - Check if exists
-        #   - Get embedding
-        #   - Add or update in collection
-        # TODO: Return statistics
+            return {"added": 0, "updated": 0, "skipped": 0}
+
+        stats = {"added": 0, "updated": 0, "skipped": 0}
+
+        if update_mode == "replace":
+            existing = self.get_file_documents(file_path)
+            if existing:
+                self.collection.delete(ids=existing)
+                logger.info("[replace] removed %d existing chunks for %s",
+                            len(existing), file_path.name)
+
+        # Decide upfront which docs need adding vs updating vs skipping so we
+        # can embed in big batches instead of one-by-one (which would be slow
+        # and expensive on the real OpenAI API).
+        to_add_ids:   List[str] = []
+        to_add_docs:  List[str] = []
+        to_add_meta:  List[Dict[str, Any]] = []
+        to_upd_ids:   List[str] = []
+        to_upd_docs:  List[str] = []
+        to_upd_meta:  List[Dict[str, Any]] = []
+
+        for text, meta in documents:
+            doc_id = self.generate_document_id(file_path, meta)
+            exists = self.check_document_exists(doc_id) if update_mode != "replace" else False
+            if exists and update_mode == "skip":
+                stats["skipped"] += 1
+                continue
+            if exists and update_mode == "update":
+                to_upd_ids.append(doc_id); to_upd_docs.append(text); to_upd_meta.append(meta)
+            else:
+                to_add_ids.append(doc_id); to_add_docs.append(text); to_add_meta.append(meta)
+
+        # Embed + add in batches.
+        for i in range(0, len(to_add_ids), batch_size):
+            chunk_ids   = to_add_ids[i : i + batch_size]
+            chunk_docs  = to_add_docs[i : i + batch_size]
+            chunk_meta  = to_add_meta[i : i + batch_size]
+            embeddings  = self._embed_batch(chunk_docs)
+            self.collection.add(
+                ids=chunk_ids,
+                documents=chunk_docs,
+                metadatas=chunk_meta,
+                embeddings=embeddings,
+            )
+            stats["added"] += len(chunk_ids)
+
+        for i in range(0, len(to_upd_ids), batch_size):
+            chunk_ids   = to_upd_ids[i : i + batch_size]
+            chunk_docs  = to_upd_docs[i : i + batch_size]
+            chunk_meta  = to_upd_meta[i : i + batch_size]
+            embeddings  = self._embed_batch(chunk_docs)
+            self.collection.update(
+                ids=chunk_ids,
+                documents=chunk_docs,
+                metadatas=chunk_meta,
+                embeddings=embeddings,
+            )
+            stats["updated"] += len(chunk_ids)
 
         return stats
-    
-    def process_all_text_data(self, base_path: str, update_mode: str = 'skip') -> Dict[str, int]:
-        """
-        Process all text files and add to ChromaDB
-        
-        Args:
-            base_path: Base directory containing data folders
-            update_mode: How to handle existing documents:
-                        'skip' - skip existing documents (default)
-                        'update' - update existing documents
-                        'replace' - delete all existing documents from file and re-add
-            
-        Returns:
-            Statistics about processed files
-        """
-        stats = {
-            'files_processed': 0,
-            'documents_added': 0,
-            'documents_updated': 0,
-            'documents_skipped': 0,
-            'errors': 0,
-            'total_chunks': 0,
-            'missions': {}
+
+    def process_all_text_data(self, base_path: str, update_mode: str = "skip") -> Dict[str, Any]:
+        """Process all text files under base_path and store them in ChromaDB."""
+        stats: Dict[str, Any] = {
+            "files_processed": 0,
+            "documents_added": 0,
+            "documents_updated": 0,
+            "documents_skipped": 0,
+            "errors": 0,
+            "total_chunks": 0,
+            "missions": {},
         }
-        
-        # TODO: Get files to process
-        # TODO: Loop through each file
-        # TODO: Process file and add to collection
-        # TODO: Update statistics
-        # TODO: Handle errors gracefully
-        
+        files = self.scan_text_files_only(base_path)
+        for file_path in files:
+            try:
+                chunks = self.process_text_file(file_path)
+                if not chunks:
+                    logger.info("No chunks produced for %s — skipping", file_path)
+                    continue
+                file_stats = self.add_documents_to_collection(
+                    chunks, file_path, update_mode=update_mode
+                )
+                mission = self.extract_mission_from_path(file_path)
+                ms = stats["missions"].setdefault(
+                    mission, {"files": 0, "chunks": 0, "added": 0, "updated": 0, "skipped": 0}
+                )
+                ms["files"]   += 1
+                ms["chunks"]  += len(chunks)
+                ms["added"]   += file_stats["added"]
+                ms["updated"] += file_stats["updated"]
+                ms["skipped"] += file_stats["skipped"]
+                stats["files_processed"]   += 1
+                stats["total_chunks"]      += len(chunks)
+                stats["documents_added"]   += file_stats["added"]
+                stats["documents_updated"] += file_stats["updated"]
+                stats["documents_skipped"] += file_stats["skipped"]
+            except Exception as exc:
+                stats["errors"] += 1
+                logger.error("Error processing %s: %s", file_path, exc)
         return stats
-    
-    def get_collection_info(self) -> Dict[str, Any]:
-        """Get information about the ChromaDB collection"""
-        # TODO: Return collection name, document count, metadata
-        pass
-    
-    def query_collection(self, query_text: str, n_results: int = 5) -> Dict[str, Any]:
-        """
-        Query the collection for testing
-        
-        Args:
-            query_text: Query text
-            n_results: Number of results to return
-            
-        Returns:
-            Query results
-        """
-        # TODO: Perform test query and return results
-        pass
-    
-    def get_collection_stats(self) -> Dict[str, Any]:
-        """Get detailed statistics about the collection"""
-        try:
-            # Get all documents to analyze
-            all_docs = self.collection.get()
-            
-            if not all_docs['metadatas']:
-                return {'error': 'No documents in collection'}
-            
-            stats = {
-                'total_documents': len(all_docs['metadatas']),
-                'missions': {},
-                'data_types': {},
-                'document_categories': {},
-                'file_types': {}
-            }
-            
-            # Analyze metadata
-            for metadata in all_docs['metadatas']:
-                mission = metadata.get('mission', 'unknown')
-                data_type = metadata.get('data_type', 'unknown')
-                doc_category = metadata.get('document_category', 'unknown')
-                file_type = metadata.get('file_type', 'unknown')
-                
-                # Count by mission
-                stats['missions'][mission] = stats['missions'].get(mission, 0) + 1
-                
-                # Count by data type
-                stats['data_types'][data_type] = stats['data_types'].get(data_type, 0) + 1
-                
-                # Count by document category
-                stats['document_categories'][doc_category] = stats['document_categories'].get(doc_category, 0) + 1
-                
-                # Count by file type
-                stats['file_types'][file_type] = stats['file_types'].get(file_type, 0) + 1
-            
-            return stats
-            
-        except Exception as e:
-            logger.error(f"Error getting collection stats: {e}")
-            return {'error': str(e)}
 
+    # -------------------------------------------------------------- inspection
+    def get_collection_info(self) -> Dict[str, Any]:
+        try:
+            return {
+                "collection_name": self.collection_name,
+                "persist_directory": self.chroma_persist_directory,
+                "document_count": self.collection.count(),
+            }
+        except Exception as exc:
+            return {"collection_name": self.collection_name, "error": str(exc)}
+
+    def query_collection(self, query_text: str, n_results: int = 5) -> Dict[str, Any]:
+        """Run a test query against the collection."""
+        try:
+            if self._mock:
+                # Inject a precomputed embedding so chroma doesn't try to call
+                # an embedding function we haven't installed on the collection.
+                return self.collection.query(
+                    query_embeddings=[self.get_embedding(query_text)],
+                    n_results=n_results,
+                )
+            return self.collection.query(query_texts=[query_text], n_results=n_results)
+        except Exception as exc:
+            logger.error("Query failed: %s", exc)
+            return {"error": str(exc)}
+
+    def get_collection_stats(self) -> Dict[str, Any]:
+        try:
+            all_docs = self.collection.get()
+            metas = all_docs.get("metadatas") or []
+            if not metas:
+                return {
+                    "total_documents": 0,
+                    "missions": {}, "data_types": {},
+                    "document_categories": {}, "file_types": {},
+                }
+            stats = {
+                "total_documents": len(metas),
+                "missions": {}, "data_types": {},
+                "document_categories": {}, "file_types": {},
+            }
+            for m in metas:
+                m = m or {}
+                for key, bucket in (
+                    ("mission", "missions"),
+                    ("data_type", "data_types"),
+                    ("document_category", "document_categories"),
+                    ("file_type", "file_types"),
+                ):
+                    v = m.get(key, "unknown")
+                    stats[bucket][v] = stats[bucket].get(v, 0) + 1
+            return stats
+        except Exception as exc:
+            logger.error("Error getting collection stats: %s", exc)
+            return {"error": str(exc)}
+
+
+# ============================================================================
+# CLI
+# ============================================================================
 def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description='ChromaDB Embedding Pipeline for NASA Data')
-    parser.add_argument('--data-path', default='.', help='Path to data directories')
-    parser.add_argument('--openai-key', required=True, help='OpenAI API key')
-    parser.add_argument('--chroma-dir', default='./chroma_db_openai', help='ChromaDB persist directory')
-    parser.add_argument('--collection-name', default='nasa_space_missions_text', help='Collection name')
-    parser.add_argument('--embedding-model', default='text-embedding-3-small', help='OpenAI embedding model')
-    parser.add_argument('--chunk-size', type=int, default=500, help='Text chunk size')
-    parser.add_argument('--chunk-overlap', type=int, default=100, help='Chunk overlap size')
-    parser.add_argument('--batch-size', type=int, default=50, help='Batch size for processing')
-    parser.add_argument('--update-mode', choices=['skip', 'update', 'replace'], default='skip',
-                       help='How to handle existing documents: skip, update, or replace')
-    parser.add_argument('--test-query', help='Test query after processing')
-    parser.add_argument('--stats-only', action='store_true', help='Only show collection statistics')
-    parser.add_argument('--delete-source', help='Delete all documents from a specific source pattern')
-    
+    parser = argparse.ArgumentParser(description="ChromaDB Embedding Pipeline for NASA Data")
+    parser.add_argument("--data-path", default="./data_text", help="Path to data directories")
+    parser.add_argument("--openai-key", default=os.getenv("OPENAI_API_KEY", ""),
+                        help="OpenAI API key (or set OPENAI_API_KEY env var)")
+    parser.add_argument("--chroma-dir", default="./chroma_db_openai", help="ChromaDB persist directory")
+    parser.add_argument("--collection-name", default="nasa_space_missions_text", help="Collection name")
+    parser.add_argument("--embedding-model", default="text-embedding-3-small", help="OpenAI embedding model")
+    parser.add_argument("--chunk-size", type=int, default=1000, help="Text chunk size in characters")
+    parser.add_argument("--chunk-overlap", type=int, default=200, help="Chunk overlap in characters")
+    parser.add_argument("--batch-size", type=int, default=50, help="Batch size for embedding calls")
+    parser.add_argument("--update-mode", choices=["skip", "update", "replace"], default="skip",
+                        help="How to handle existing documents")
+    parser.add_argument("--test-query", help="Run a test similarity query after processing")
+    parser.add_argument("--stats-only", action="store_true",
+                        help="Print collection statistics and exit, do not (re)process files")
+    parser.add_argument("--delete-source", help="Delete all documents whose source contains this pattern")
     args = parser.parse_args()
-    
-    # Initialize pipeline
+
+    is_mock = os.getenv("NASA_RAG_MOCK") == "1"
+    is_local = os.getenv("EMBEDDING_PROVIDER", "").lower() == "sentence-transformers"
+    if not args.openai_key and not is_mock and not is_local:
+        parser.error(
+            "--openai-key (or OPENAI_API_KEY env var) is required, unless "
+            "NASA_RAG_MOCK=1 or EMBEDDING_PROVIDER=sentence-transformers"
+        )
+
     logger.info("Initializing ChromaDB Embedding Pipeline...")
     pipeline = ChromaEmbeddingPipelineTextOnly(
         openai_api_key=args.openai_key,
@@ -514,65 +581,60 @@ def main():
         collection_name=args.collection_name,
         embedding_model=args.embedding_model,
         chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap
+        chunk_overlap=args.chunk_overlap,
     )
-    
-    # Handle delete source operation
+
     if args.delete_source:
-        deleted_count = pipeline.delete_documents_by_source(args.delete_source)
-        logger.info(f"Deleted {deleted_count} documents matching source pattern: {args.delete_source}")
+        deleted = pipeline.delete_documents_by_source(args.delete_source)
+        logger.info("Deleted %d documents matching: %s", deleted, args.delete_source)
         return
-    
-    # If stats only, show collection statistics and exit
+
     if args.stats_only:
         logger.info("Collection Statistics:")
-        stats = pipeline.get_collection_stats()
-        for key, value in stats.items():
-            logger.info(f"{key}: {value}")
+        s = pipeline.get_collection_stats()
+        for key, value in s.items():
+            logger.info("%s: %s", key, value)
+        info = pipeline.get_collection_info()
+        logger.info("Collection info: %s", info)
         return
-    
-    # Process all data
-    logger.info(f"Starting text data processing with update mode: {args.update_mode}")
-    start_time = time.time()
-    
+
+    logger.info("Starting text data processing with update mode: %s", args.update_mode)
+    start = time.time()
     stats = pipeline.process_all_text_data(args.data_path, update_mode=args.update_mode)
-    
-    end_time = time.time()
-    processing_time = end_time - start_time
-    
-    # Print results
+    elapsed = time.time() - start
+
     logger.info("=" * 60)
     logger.info("PROCESSING COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"Files processed: {stats['files_processed']}")
-    logger.info(f"Total chunks created: {stats['total_chunks']}")
-    logger.info(f"Documents added to collection: {stats['documents_added']}")
-    logger.info(f"Documents updated in collection: {stats['documents_updated']}")
-    logger.info(f"Documents skipped (already exist): {stats['documents_skipped']}")
-    logger.info(f"Errors: {stats['errors']}")
-    logger.info(f"Processing time: {processing_time:.2f} seconds")
-    
-    # Mission breakdown
+    logger.info("Files processed: %d", stats["files_processed"])
+    logger.info("Total chunks created: %d", stats["total_chunks"])
+    logger.info("Documents added to collection: %d", stats["documents_added"])
+    logger.info("Documents updated in collection: %d", stats["documents_updated"])
+    logger.info("Documents skipped (already exist): %d", stats["documents_skipped"])
+    logger.info("Errors: %d", stats["errors"])
+    logger.info("Processing time: %.2f seconds", elapsed)
+
     logger.info("\nMission breakdown:")
-    for mission, mission_stats in stats['missions'].items():
-        logger.info(f"  {mission}: {mission_stats['files']} files, {mission_stats['chunks']} chunks")
-        logger.info(f"    Added: {mission_stats['added']}, Updated: {mission_stats['updated']}, Skipped: {mission_stats['skipped']}")
-    
-    # Collection info
-    collection_info = pipeline.get_collection_info()
-    logger.info(f"\nCollection: {collection_info.get('collection_name', 'N/A')}")
-    logger.info(f"Total documents in collection: {collection_info.get('document_count', 'N/A')}")
-    
-    # Test query if provided
+    for mission, ms in stats["missions"].items():
+        logger.info("  %s: %d files, %d chunks", mission, ms["files"], ms["chunks"])
+        logger.info("    Added: %d, Updated: %d, Skipped: %d",
+                    ms["added"], ms["updated"], ms["skipped"])
+
+    info = pipeline.get_collection_info()
+    logger.info("\nCollection: %s", info.get("collection_name", "N/A"))
+    logger.info("Total documents in collection: %s", info.get("document_count", "N/A"))
+
     if args.test_query:
-        logger.info(f"\nTesting query: '{args.test_query}'")
+        logger.info("\nTesting query: %r", args.test_query)
         results = pipeline.query_collection(args.test_query)
-        if results and 'documents' in results:
-            logger.info(f"Found {len(results['documents'][0])} results:")
-            for i, doc in enumerate(results['documents'][0][:3]):  # Show top 3
-                logger.info(f"Result {i+1}: {doc[:200]}...")
-    
+        if results and "documents" in results:
+            docs = results["documents"][0] if results["documents"] else []
+            logger.info("Found %d results:", len(docs))
+            for i, doc in enumerate(docs[:3]):
+                logger.info("Result %d: %s...", i + 1, doc[:200])
+
     logger.info("Pipeline completed successfully!")
+
 
 if __name__ == "__main__":
     main()
